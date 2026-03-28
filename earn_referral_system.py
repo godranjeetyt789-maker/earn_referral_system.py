@@ -4,7 +4,7 @@ import threading
 import time
 import asyncio
 import logging
-import requests # <--- NEW IMPORT ADDED
+import requests
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -16,7 +16,7 @@ from jinja2 import Environment, DictLoader
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes, TypeHandler
+    filters, ContextTypes, TypeHandler, ApplicationHandlerStop
 )
 from telegram.error import TelegramError
 
@@ -35,7 +35,9 @@ DEFAULT_DAILY_BONUS = 5
 DEFAULT_MIN_WITHDRAW = 100
 
 DB_FILE = "bot_database.db"
-FLASK_PORT = 5000
+
+# 🟢 FIXED: Render dynamic PORT configuration
+FLASK_PORT = int(os.environ.get("PORT", 5000))
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -44,23 +46,29 @@ logger = logging.getLogger(__name__)
 # DATABASE SYSTEM
 # ==========================================
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    # 🟢 FIXED: Added timeout to prevent database lock issues between Telegram & Flask
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=20.0)
     conn.row_factory = sqlite3.Row
     return conn
 
 def query_db(query, args=(), one=False, commit=False):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute(query, args)
-    rv = cur.fetchall()
-    if commit:
-        conn.commit()
-    last_id = cur.lastrowid
-    conn.close()
-    return last_id if commit else (rv[0] if rv else None) if one else rv
+    try:
+        cur.execute(query, args)
+        rv = cur.fetchall()
+        if commit:
+            conn.commit()
+        last_id = cur.lastrowid
+        return last_id if commit else (rv[0] if rv else None) if one else rv
+    except Exception as e:
+        logger.error(f"Database Error: {e}")
+        return None
+    finally:
+        conn.close()
 
 def init_db():
-    queries = [
+    queries =[
         """CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id BIGINT UNIQUE, username TEXT, 
             join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP, total_referrals INT DEFAULT 0, 
@@ -110,12 +118,10 @@ def init_db():
         if not query_db("SELECT * FROM settings WHERE key=?", (k,), one=True):
             query_db("INSERT INTO settings (key, value) VALUES (?, ?)", (k, v), commit=True)
 
-    # Auto-Fix Old Invalid Token Issue
     current_db_token = query_db("SELECT value FROM settings WHERE key='bot_token'", one=True)
     if current_db_token and current_db_token['value'] == "8440702378:AAFWNjRA5ry4cx3MF8WsYIPtgAj4I69xcuA":
         query_db("UPDATE settings SET value=? WHERE key='bot_token'", (BOT_TOKEN,), commit=True)
 
-    # Auto-fix column for old databases (safe migration)
     try:
         query_db("ALTER TABLE users ADD COLUMN last_bonus TIMESTAMP", commit=True)
     except sqlite3.OperationalError:
@@ -351,7 +357,7 @@ HTML_TEMPLATES = {
                     </select>
                 </div>
                 <div class="md:col-span-2"><label class="block text-sm mb-2 text-gray-400">Welcome Message</label><textarea name="welcome_message" rows="3" class="w-full p-3 bg-gray-700 rounded border border-gray-600 focus:border-blue-500">{{ settings.welcome_message }}</textarea></div>
-                <div class="md:col-span-2"><label class="block text-sm mb-2 text-gray-400">Bot Token</label><input type="text" name="bot_token" value="{{ settings.bot_token }}" class="w-full p-3 bg-gray-700 rounded border border-gray-600 focus:border-blue-500"><p class="text-xs text-red-400 mt-1">If you change the token, you MUST restart the python script manually from the terminal for it to take effect.</p></div>
+                <div class="md:col-span-2"><label class="block text-sm mb-2 text-gray-400">Bot Token</label><input type="text" name="bot_token" value="{{ settings.bot_token }}" class="w-full p-3 bg-gray-700 rounded border border-gray-600 focus:border-blue-500"><p class="text-xs text-red-400 mt-1">If you change the token, you MUST restart the app manually from the terminal for it to take effect.</p></div>
                 <div class="md:col-span-2 pt-4 border-t border-gray-700">
                     <h3 class="text-lg font-bold mb-4">Change Admin Password</h3>
                     <div class="grid grid-cols-2 gap-4">
@@ -382,7 +388,8 @@ HTML_TEMPLATES = {
 # FLASK WEB SERVER (ADMIN PANEL)
 # ==========================================
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
+# 🟢 FIXED: Fixed Static Secret key so Admin doesn't get logged out on render restart
+app.secret_key = "secure_fixed_secret_key_123" 
 env = Environment(loader=DictLoader(HTML_TEMPLATES))
 
 def login_required(f):
@@ -396,9 +403,7 @@ def login_required(f):
 def render(template_name, **context):
     return env.get_template(template_name).render(session=session, **context)
 
-# ======== NEW FUNCTION TO SEND MSG ========
 def send_telegram_message(chat_id, text):
-    """Admin panel se user ko notification bhejta hai (Sync mode)"""
     token = get_setting('bot_token') or BOT_TOKEN
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
@@ -410,7 +415,6 @@ def send_telegram_message(chat_id, text):
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
         logger.error(f"Failed to send notification via HTTP: {e}")
-# ========================================
 
 @app.route('/')
 def index():
@@ -519,14 +523,12 @@ def admin_withdraws():
     reqs = query_db("SELECT * FROM withdraw_requests ORDER BY id DESC")
     return render('withdraw.html', requests=reqs)
 
-# ======== FIX: WITHDRAWAL ACTION WITH NOTIFICATION ========
 @app.route('/admin/withdraw/action', methods=['POST'])
 @login_required
 def admin_withdraw_action():
-    action = request.form['action'] # Approve or Reject
+    action = request.form['action'] 
     req_id = request.form['id']
     
-    # Withdrawal details nikalo update se pehle
     w = query_db("SELECT user_id, amount FROM withdraw_requests WHERE id=?", (req_id,), one=True)
     if not w:
         return redirect(url_for('admin_withdraws'))
@@ -537,7 +539,6 @@ def admin_withdraw_action():
     final_status = 'Approved' if action == 'Approve' else 'Rejected'
     query_db("UPDATE withdraw_requests SET status=? WHERE id=?", (final_status, req_id), commit=True)
     
-    # Status ke hisaab se action lo aur Telegram message bhejo
     if action == 'Approve':
         text = f"✅ <b>Withdrawal Approved!</b>\nYour withdrawal request of <b>{amount} coins</b> has been successfully processed."
         send_telegram_message(user_id, text)
@@ -548,7 +549,6 @@ def admin_withdraw_action():
         send_telegram_message(user_id, text)
         
     return redirect(url_for('admin_withdraws'))
-# ==========================================================
 
 @app.route('/admin/settings', methods=['GET'])
 @login_required
@@ -560,7 +560,7 @@ def admin_settings():
 @app.route('/admin/settings/save', methods=['POST'])
 @login_required
 def admin_save_settings():
-    keys = ['referral_reward', 'daily_bonus', 'min_withdraw', 'welcome_message', 'force_join', 'bot_token']
+    keys =['referral_reward', 'daily_bonus', 'min_withdraw', 'welcome_message', 'force_join', 'bot_token']
     for k in keys:
         if k in request.form:
             set_setting(k, request.form[k])
@@ -585,19 +585,18 @@ def admin_broadcast_send():
 
 
 def run_flask():
+    logger.info(f"Starting Flask Server on port {FLASK_PORT}...")
+    # 🟢 FIXED: Web server will now bind to Render's required PORT
     app.run(host='0.0.0.0', port=FLASK_PORT, debug=False, use_reloader=False)
 
 # ==========================================
 # TELEGRAM BOT SYSTEM
 # ==========================================
 
-# Simple state dict for handling multi-step withdrawal logic
 USER_STATES = {}
 
 def get_main_keyboard():
-    keyboard = [
-        [KeyboardButton("💰 Balance"), KeyboardButton("👥 Referrals"), KeyboardButton("🎁 Daily Bonus")],
-        [KeyboardButton("📋 Tasks"), KeyboardButton("💳 Withdraw"), KeyboardButton("🏆 Leaderboard")],
+    keyboard = [[KeyboardButton("💰 Balance"), KeyboardButton("👥 Referrals"), KeyboardButton("🎁 Daily Bonus")],[KeyboardButton("📋 Tasks"), KeyboardButton("💳 Withdraw"), KeyboardButton("🏆 Leaderboard")],
         [KeyboardButton("👤 Profile"), KeyboardButton("ℹ️ Help")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -615,11 +614,11 @@ async def check_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if get_setting('force_join') == '1':
         channels = query_db("SELECT * FROM channels WHERE is_active=1")
         if channels:
-            not_joined = []
+            not_joined =[]
             for c in channels:
                 try:
                     member = await context.bot.get_chat_member(chat_id=c['channel_id'], user_id=user_id)
-                    if member.status not in ['member', 'administrator', 'creator']:
+                    if member.status not in['member', 'administrator', 'creator']:
                         not_joined.append(c)
                 except Exception as e:
                     logger.error(f"Force join check failed for {c['channel_id']}: {e}")
@@ -637,7 +636,6 @@ async def check_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.callback_query.message.reply_text(msg, reply_markup=markup, parse_mode='Markdown')
                     await update.callback_query.answer()
                 
-                from telegram.ext import ApplicationHandlerStop
                 raise ApplicationHandlerStop()
 
 async def broadcast_job(context: ContextTypes.DEFAULT_TYPE):
@@ -646,13 +644,14 @@ async def broadcast_job(context: ContextTypes.DEFAULT_TYPE):
         query_db("UPDATE broadcast_queue SET status='Processing' WHERE id=?", (item['id'],), commit=True)
         users = query_db("SELECT user_id FROM users WHERE is_blocked=0")
         success = 0
-        for u in users:
-            try:
-                await context.bot.send_message(chat_id=u['user_id'], text=item['message'], parse_mode='HTML')
-                success += 1
-                await asyncio.sleep(0.05) 
-            except:
-                pass
+        if users:
+            for u in users:
+                try:
+                    await context.bot.send_message(chat_id=u['user_id'], text=item['message'], parse_mode='HTML')
+                    success += 1
+                    await asyncio.sleep(0.05) 
+                except:
+                    pass
         query_db("UPDATE broadcast_queue SET status='Done' WHERE id=?", (item['id'],), commit=True)
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -677,8 +676,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome = get_setting('welcome_message')
     await update.message.reply_text(welcome, reply_markup=get_main_keyboard(), parse_mode='HTML')
 
-
-# Helper function for finalizing the withdrawal
 async def process_withdrawal(update, user_id, amount, method, details):
     query_db("UPDATE users SET balance = balance - ? WHERE user_id=?", (amount, user_id), commit=True)
     query_db("INSERT INTO withdraw_requests (user_id, amount, method, details) VALUES (?, ?, ?, ?)", 
@@ -689,21 +686,17 @@ async def process_withdrawal(update, user_id, amount, method, details):
         
     await update.message.reply_text("✅ *Withdrawal Request Submitted Successfully!*\nIt will be reviewed by an admin.", parse_mode='Markdown', reply_markup=get_main_keyboard())
 
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text: return
     text = update.message.text
     user_id = update.effective_user.id
     
-    # Global Cancel Logic
     if text == "❌ Cancel":
         if user_id in USER_STATES: 
             del USER_STATES[user_id]
         await update.message.reply_text("❌ Action cancelled.", reply_markup=get_main_keyboard())
         return
 
-    # ==============================================
-    # ADVANCED STEP-BY-STEP WITHDRAWAL SYSTEM
-    # ==============================================
     if user_id in USER_STATES:
         state = USER_STATES[user_id]
         
@@ -725,8 +718,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 USER_STATES[user_id]['amount'] = amount
                 USER_STATES[user_id]['step'] = 'method'
                 
-                method_kb = ReplyKeyboardMarkup([
-                    [KeyboardButton("🏦 Bank Transfer"), KeyboardButton("📱 UPI")],
+                method_kb = ReplyKeyboardMarkup([[KeyboardButton("🏦 Bank Transfer"), KeyboardButton("📱 UPI")],
                     [KeyboardButton("💳 Crypto"), KeyboardButton("❌ Cancel")]
                 ], resize_keyboard=True)
                 
@@ -755,7 +747,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Please select a valid method from the keyboard.")
             return
             
-        # --- BANK TRANSFER STEPS ---
         elif state['step'] == 'bank_name':
             USER_STATES[user_id]['bank_name'] = text
             USER_STATES[user_id]['step'] = 'bank_ac_num'
@@ -776,27 +767,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         elif state['step'] == 'bank_holder':
             USER_STATES[user_id]['bank_holder'] = text
-            # Combine all bank details
             details = f"Bank Name: {USER_STATES[user_id]['bank_name']}\nA/C No: {USER_STATES[user_id]['bank_ac_num']}\nIFSC: {USER_STATES[user_id]['bank_ifsc']}\nHolder: {USER_STATES[user_id]['bank_holder']}"
             await process_withdrawal(update, user_id, state['amount'], "Bank Transfer", details)
             return
 
-        # --- UPI STEP ---
         elif state['step'] == 'upi_id':
             details = f"UPI ID: {text}"
             await process_withdrawal(update, user_id, state['amount'], "UPI", details)
             return
             
-        # --- CRYPTO STEP ---
         elif state['step'] == 'crypto_address':
             details = f"Wallet Address: {text}"
             await process_withdrawal(update, user_id, state['amount'], "Crypto", details)
             return
-
-
-    # ==============================================
-    # NORMAL COMMANDS
-    # ==============================================
 
     if text == "💰 Balance":
         u = query_db("SELECT balance FROM users WHERE user_id=?", (user_id,), one=True)
@@ -818,7 +801,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u = query_db("SELECT last_bonus FROM users WHERE user_id=?", (user_id,), one=True)
         now = datetime.now()
         can_claim = True
-        if u['last_bonus']:
+        if u and u['last_bonus']:
             last = datetime.strptime(u['last_bonus'], "%Y-%m-%d %H:%M:%S")
             if now < last + timedelta(days=1):
                 can_claim = False
@@ -855,21 +838,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_STATES[user_id] = {'step': 'amount'}
         await update.message.reply_text(f"💳 *Withdrawal Process*\n\nYour balance: {u['balance']} coins\nMinimum: {min_w} coins\n\nPlease enter the *AMOUNT* you want to withdraw:", parse_mode='Markdown', reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True))
 
-    # ======== FIX: LEADERBOARD ========
     elif text == "🏆 Leaderboard":
         top = query_db("SELECT username, total_referrals, balance FROM users WHERE is_blocked=0 ORDER BY total_referrals DESC, balance DESC LIMIT 10")
         msg = "🏆 <b>Top 10 Users Leaderboard</b>\n\n"
-        for i, t in enumerate(top, 1):
-            name = t['username'] or "Unknown"
-            # Taki agar username me special characters ho to parse error na aye
-            name = name.replace('<', '&lt;').replace('>', '&gt;')
-            msg += f"<b>{i}.</b> {name} - {t['total_referrals']} Refs | {t['balance']} Coins\n"
-        await update.message.reply_text(msg, parse_mode='HTML') # Changed Markdown to HTML
-    # ==================================
+        if top:
+            for i, t in enumerate(top, 1):
+                name = t['username'] or "Unknown"
+                name = name.replace('<', '&lt;').replace('>', '&gt;')
+                msg += f"<b>{i}.</b> {name} - {t['total_referrals']} Refs | {t['balance']} Coins\n"
+        else:
+            msg += "No users found."
+        await update.message.reply_text(msg, parse_mode='HTML')
 
     elif text == "👤 Profile":
         u = query_db("SELECT * FROM users WHERE user_id=?", (user_id,), one=True)
-        tasks_done = query_db("SELECT COUNT(*) as c FROM user_tasks WHERE user_id=?", (user_id,), one=True)['c']
+        t_res = query_db("SELECT COUNT(*) as c FROM user_tasks WHERE user_id=?", (user_id,), one=True)
+        tasks_done = t_res['c'] if t_res else 0
         msg = f"👤 *Your Profile*\n\n" \
               f"🆔 ID: `{u['user_id']}`\n" \
               f"📅 Joined: {u['join_date'][:10]}\n\n" \
@@ -886,7 +870,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
               "4. *Withdraw*: Once you reach the minimum amount, click 💳 Withdraw and follow the steps."
         await update.message.reply_text(msg, parse_mode='Markdown')
 
-
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -894,7 +877,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "check_join":
         await query.answer("Checking membership...")
-        await query.message.delete()
+        try:
+            await query.message.delete()
+        except: pass
         await context.bot.send_message(chat_id=user_id, text="✅ Thank you for joining! You can now use the bot.", reply_markup=get_main_keyboard())
         return
 
@@ -915,9 +900,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
               f"Description: {task['description']}\n\n" \
               f"Click the button below to complete the task."
               
-        markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔗 Open Task Link", url=task['link'])],
-            [InlineKeyboardButton("✅ Verify & Complete", callback_data=f"task_done_{task_id}")]
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open Task Link", url=task['link'])],[InlineKeyboardButton("✅ Verify & Complete", callback_data=f"task_done_{task_id}")]
         ])
         await query.message.edit_text(msg, parse_mode='Markdown', reply_markup=markup)
 
