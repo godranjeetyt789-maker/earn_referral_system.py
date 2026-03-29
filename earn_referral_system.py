@@ -11,7 +11,7 @@ from functools import wraps
 # Flask imports
 from flask import Flask, request, session, redirect, url_for, render_template_string
 from jinja2 import Environment, DictLoader
-from werkzeug.middleware.proxy_fix import ProxyFix  # <--- NEW: Render HTTPS Proxy Fix
+from werkzeug.middleware.proxy_fix import ProxyFix  # Render HTTPS Proxy Fix
 
 # Telegram imports
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
@@ -135,7 +135,7 @@ def set_setting(key, value):
 init_db()
 
 # ==========================================
-# ADMIN PANEL EMBEDDED TEMPLATES (Trimmed HTML logic stays same)
+# ADMIN PANEL EMBEDDED TEMPLATES
 # ==========================================
 HTML_TEMPLATES = {
     'base.html': """
@@ -592,8 +592,10 @@ def run_flask():
 USER_STATES = {}
 
 def get_main_keyboard():
-    keyboard = [[KeyboardButton("💰 Balance"), KeyboardButton("👥 Referrals"), KeyboardButton("🎁 Daily Bonus")],[KeyboardButton("📋 Tasks"), KeyboardButton("💳 Withdraw"), KeyboardButton("🏆 Leaderboard")],
-        [KeyboardButton("👤 Profile"), KeyboardButton("ℹ️ Help")]
+    # YAHAN AAPKA NAYA BUTTON LAYOUT SET HAI (Ekdum Perfect)
+    keyboard = [[KeyboardButton("👤 Profile"), KeyboardButton("📋 Tasks")],
+        [KeyboardButton("🎁 Daily Bonus"), KeyboardButton("👥 Referrals")],
+        [KeyboardButton("💰 Balance"), KeyboardButton("💳 Withdraw")],[KeyboardButton("🏆 Leaderboard"), KeyboardButton("ℹ️ Help")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -712,8 +714,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 USER_STATES[user_id]['amount'] = amount
                 USER_STATES[user_id]['step'] = 'method'
                 
-                method_kb = ReplyKeyboardMarkup([
-                    [KeyboardButton("🏦 Bank Transfer"), KeyboardButton("📱 UPI")],[KeyboardButton("💳 Crypto"), KeyboardButton("❌ Cancel")]
+                method_kb = ReplyKeyboardMarkup([[KeyboardButton("🏦 Bank Transfer"), KeyboardButton("📱 UPI")],[KeyboardButton("💳 Crypto"), KeyboardButton("❌ Cancel")]
                 ], resize_keyboard=True)
                 
                 await update.message.reply_text("🏦 *Select Payment Method:*", parse_mode='Markdown', reply_markup=method_kb)
@@ -817,7 +818,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("There are no available tasks right now.")
             return
             
-        markup = []
+        markup =[]
         for t in tasks:
             markup.append([InlineKeyboardButton(f"🪙 {t['reward']} | {t['title']}", callback_data=f"task_info_{t['id']}")])
         await update.message.reply_text("📋 *Available Tasks*\nSelect a task below to complete it:", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(markup))
